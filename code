@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jun  1 21:40:21 2023
+
+@author: benjaminlear
+"""
+
+'''
+#basic plan of attack
+1. import the reference and the sample spectra. 
+2. for the reference spectra, pull out the sections you want to fit these are the regions to put through the fitter. 
+3. Interpolate the reference spectra to the resolution you want (e.g., 0.001ppm)
+4. In the fitting loop... 
+    a. add a shift to the sample spectra
+    b. interpolate on the same x axis as the reference
+    c. multiply and basline correct
+    d. return the shift, baseline, and intensity corrections
+5. Plot the results for both and print shift for both, as well as the difference in shift. 
+''' 
+
+import numpy as np
+from pathlib import Path
+import plotly
+import plotly.subplots as sp
+from scipy.interpolate import CubicSpline
+import math
+from lmfit import Model, minimize, Parameters
+
+
+# specify the folder, and files that have your NMR spectra
+folder = Path("/Users/benjaminlear/My Drive/PennState/Research/Data/Kristen Aviles/NMR/csv")
+blank_file = "58_BAD-CDCl3_w_d-DCM_insert.csv" # spectrum without nanoparticles
+sample_file = "53_BAD-PdSC4_in_CDCl3_w_d-DCM_insert.csv" # spectrum with nanoparticles
+
+# set up the windows you want to consider for the fitting. 
+# don't make it too wide or too narrow... helpful, I know. 
+ref_lims = [7.18, 7.27] # limits for the reference peaks (solvent with no nanoparticles)
+sig_lims = [5.20, 5.28] # limits for the signal peaks (solven with nanoparticles)
+
+
+# this will read the NMR spectra
+# right now, this assums there is no header, since that is what I was given
+blank = np.loadtxt(folder/blank_file, delimiter="\t", usecols=[0,1], unpack=True)
+sample = np.loadtxt(folder/sample_file, delimiter="\t", usecols=[0,1], unpack=True)
+
+#create the splines for the blank and sample spectra
+# this will be used below to create the interpolated spectra 
+blank_spl = CubicSpline(blank[0], blank[1])
+sample_spl = CubicSpline(sample[0], sample[1])
+
+# set the resolution for the splined data to be 10 times smaller than the spacing between points normally
+resolution = abs(blank[0][0] - blank[0][1])/10
+
+#make x-values for the spline
+# we make them for both the reference and signals portions
+ref_x = np.linspace(ref_lims[0], ref_lims[1], math.ceil(abs(ref_lims[0] - ref_lims[1])/resolution))
+sig_x = np.linspace(sig_lims[0], sig_lims[1], math.ceil(abs(sig_lims[0] - sig_lims[1])/resolution))
+
+#make the iterpolated spectra for the reference
+blank_ref = [
+    ref_x,
+    blank_spl(ref_x)
+    ]
+
+blank_sig = [
+    sig_x,
+    blank_spl(sig_x)
+    ]
+
+# now for the sample
+sample_ref = [
+    ref_x,
+    sample_spl(ref_x)
+    ]
+
+sample_sig = [
+    sig_x,
+    sample_spl(sig_x)
+    ]
+
+#% now we start the fitting...
+
+#this function will take the spectrum of interest, shift it, then take a spline that can be used to produce a signal at the correct x
+def shift_baseline_scale (old_x, old_y, shift, baseline, scale, new_x):
+    shifted_x = old_x + shift
+    shifted_spl = CubicSpline(shifted_x, old_y)
+    return scale * shifted_spl(new_x) + baseline
+
+shift_model = Model(shift_baseline_scale, independent_vars=['old_x', "old_y", "new_x"])  #$make sure we pass the adjustable and indpedent variables. 
+
+shift_model_params = shift_model.make_params()
+
+#get the positions (in ppm) of the max positions for the blank and the sample
+blank_max_pos = blank_sig[0][np.where(blank_sig[1]==max(blank_sig[1]))[0]]
+sample_max_pos = sample_sig[0][np.where(sample_sig[1]==max(sample_sig[1]))[0]]
+
+
+shift_model_params.add_many(    
+    ('shift',    float(blank_max_pos - sample_max_pos)  , True, None,  None, None, None), #maybe the right way to set bounds is the max and min of derivative shape
+    ('baseline', min(blank_sig[1]) - min(sample_sig[1]) , True, None,  None, None, None), # so find the max value in y, and use that index +0.05 to find the largest g value
+    ('scale',    max(blank_sig[1]) / max(sample_sig[1]) , True, 0,  None, None, None), # find the min value in y, and and use that index -0.5 to find the smallest g-value. Something like that. 
+    )
+
+# pass the full sample spectrum... so we can shift it BEFORE we apply the spline.  That way we don't lose any data. 
+sig_fit = shift_model.fit(data = blank_sig[1], old_x = sample[0], old_y = sample[1], new_x = blank_sig[0],  params = shift_model_params)
+ref_fit = shift_model.fit(data = blank_ref[1], old_x = sample[0], old_y = sample[1], new_x = blank_ref[0],  params = shift_model_params)
+
+print(sig_fit.fit_report())
+print(ref_fit.fit_report())
+
+
+overall_shift = sig_fit.params['shift'] - ref_fit.params['shift']
+error_in_overall_shift = (sig_fit.params['shift'].stderr**2 + ref_fit.params['shift'].stderr**2)**0.5
+
+
+
+
+
+#%% Final Figure...
+
+# make subplots...
+# columns will hold the signal and reference portions
+# the rows will hold the original (top) and shifted (bottom) spectra
+fig = sp.make_subplots(rows = 2, cols=2)
+#fig = plotly.graph_objects.Figure( #make a figure, specifying default layouts
+
+fig.update_layout(
+    template="simple_white",
+    colorway=plotly.colors.qualitative.Dark2,
+    showlegend=False)
+
+#x-axes
+fig.update_xaxes(
+        title = "ppm", 
+        autorange="reversed",
+        #range = [sig_lims[0], sig_lims[1]],
+        row=1, col=1
+        )
+fig.update_xaxes(
+        title = "ppm",
+        autorange="reversed",
+        #range = [ref_lims[0], ref_lims[1]],
+        row=1, col=2
+        )
+
+#y-axes
+fig.update_yaxes(
+        title = "normalized intensity", 
+        #range = [min(blank_sig[1]), max(blank_sig[1])*1.1],
+        row=1, col=1
+        )
+fig.update_yaxes(
+         #title = "intensity", 
+         #range = [min(blank_ref[1]), max(blank_ref[1])*1.1],
+         row=1, col=2
+         )   
+
+#blank
+fig.add_scatter(x = blank_sig[0], y = blank_sig[1]/max(blank_sig[1]), mode = "lines", marker=dict(color='grey'), row=1, col = 2) # add the data trace to the figure
+fig.add_scatter(x = blank_ref[0], y = blank_ref[1]/max(blank_ref[1]), mode = "lines", marker=dict(color='grey'), row = 1, col = 1)
+
+#sample
+fig.add_scatter(x = sample_sig[0], y = sample_sig[1]/max(sample_sig[1]), mode = "lines", line=dict(dash='dot'), marker=dict(color='red'), row=1, col = 2) # add the data trace to the figure
+fig.add_scatter(x = sample_ref[0], y = sample_ref[1]/max(sample_ref[1]), mode = "lines", line=dict(dash='dot'), marker=dict(color='red'), row = 1, col = 1)
+
+
+#x-axes
+fig.update_xaxes(
+        title = "ppm", 
+        autorange="reversed",
+        #range = [sig_lims[0], sig_lims[1]],
+        row=2, col=1
+        )
+fig.update_xaxes(
+        title = "ppm",
+        autorange="reversed",
+        #range = [ref_lims[0], ref_lims[1]],
+        row=2, col=2
+        )
+
+#y-axes
+fig.update_yaxes(
+        title = "intensity", 
+        #range = [min(blank_sig[1]), max(blank_sig[1])*1.1],
+        row=2, col=1
+        )
+fig.update_yaxes(
+         #title = "intensity", 
+         #range = [min(blank_ref[1]), max(blank_ref[1])*1.1],
+         row=2, col=2
+         ) 
+#blank.... 
+fig.add_scatter(x = blank_sig[0], y = blank_sig[1], mode = "lines", marker=dict(color='grey'), row=2, col = 2)
+fig.add_scatter(x = blank_ref[0], y = blank_ref[1], mode = "lines", marker=dict(color='grey'), row = 2, col = 1)
+
+fig.add_scatter(x = sample_sig[0], y = shift_baseline_scale (sample[0], sample[1], sig_fit.params['shift'].value, sig_fit.params['baseline'].value, sig_fit.params['scale'].value, blank_sig[0]), mode = "lines", line=dict(dash='dot'), marker=dict(color='red'), row=2, col = 2) # add the data trace to the figures
+fig.add_scatter(x = sample_ref[0], y = shift_baseline_scale (sample[0], sample[1], ref_fit.params['shift'].value, ref_fit.params['baseline'].value, ref_fit.params['scale'].value, blank_ref[0]), mode = "lines", line=dict(dash='dot'), marker=dict(color='red'), row=2, col = 1) # add the data trace to the figures
+
+fig.add_annotation(text=f"shift = {ref_fit.params['shift'].value:0.6f}", x=np.mean(blank_ref[0]), y=max(blank_ref[1]*1.1), font=dict(color='red'), showarrow=False, row=2, col=1)
+fig.add_annotation(text=f"shift = {sig_fit.params['shift'].value:0.6f}", x=np.mean(blank_sig[0]), y=max(blank_sig[1]*1.1), font=dict(color='red'), showarrow=False, row=2, col=2)
+
+fig.add_annotation(
+    text=f"{blank_file} & {sample_file} <br> Δppm = {overall_shift:0.6f} +/- {error_in_overall_shift:0.6f}",
+    xref='paper',
+    yref='paper',
+    x=0,
+    y=1.1,
+    align='left',
+    showarrow=False,
+    font=dict(family='sans-serif', size=18)
+)
+
+'''
+fig.update_layout(title={
+    "text":f"{blank_file} & {sample_file} <br> Δppm = {overall_shift:0.6f} +/- {error_in_overall_shift:0.6f}",
+    'font': {'family': 'sans-serif'}
+    })
+'''
+
+fig.show('browser') # open a interactive figure in a web browser
+fig.show('png') # this one will be viewable in spyder
